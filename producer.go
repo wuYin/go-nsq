@@ -38,7 +38,7 @@ type Producer struct {
 	errorChan    chan []byte
 	closeChan    chan int
 
-	transactionChan chan *ProducerTransaction
+	transactionChan chan *ProducerTransaction // 包装消息发送方异步等待的 channel
 	transactions    []*ProducerTransaction
 	state           int32
 
@@ -104,6 +104,8 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 // This method can be used to verify that a newly-created Producer instance is
 // configured correctly, rather than relying on the lazy "connect on Publish"
 // behavior of a Producer.
+// 不仅是 Ping 保活，还有验证
+// 内部会走 connect 让新创建出的 producer 显式地与服务端建立连接，而非默认的惰性连接（connect on Publish）
 func (w *Producer) Ping() error {
 	if atomic.LoadInt32(&w.state) != StateConnected {
 		err := w.connect()
@@ -180,7 +182,7 @@ func (w *Producer) Stop() {
 	close(w.exitChan)
 	w.close()
 	w.guard.Unlock()
-	w.wg.Wait()
+	w.wg.Wait() // 等待 transactions 剩余消息都回复完毕，才能退出
 }
 
 // PublishAsync publishes a message body to the specified topic
@@ -190,8 +192,7 @@ func (w *Producer) Stop() {
 // the supplied `doneChan` (if specified)
 // will receive a `ProducerTransaction` instance with the supplied variadic arguments
 // and the response error if present
-func (w *Producer) PublishAsync(topic string, body []byte, doneChan chan *ProducerTransaction,
-	args ...interface{}) error {
+func (w *Producer) PublishAsync(topic string, body []byte, doneChan chan *ProducerTransaction, args ...interface{}) error {
 	return w.sendCommandAsync(Publish(topic, body), doneChan, args)
 }
 
@@ -247,6 +248,9 @@ func (w *Producer) DeferredPublishAsync(topic string, delay time.Duration, body 
 	return w.sendCommandAsync(DeferredPublish(topic, delay, body), doneChan, args)
 }
 
+//
+// 同步模式：仅仅是异步模式加结果 channel 阻塞等待
+//
 func (w *Producer) sendCommand(cmd *Command) error {
 	doneChan := make(chan *ProducerTransaction)
 	err := w.sendCommandAsync(cmd, doneChan, nil)
@@ -254,18 +258,22 @@ func (w *Producer) sendCommand(cmd *Command) error {
 		close(doneChan)
 		return err
 	}
-	t := <-doneChan
+	t := <-doneChan // 阻塞 Publish
 	return t.Error
 }
 
-func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
-	args []interface{}) error {
+//
+// 异步模式：将消息放入 transactionChan 即返回，服务端的回复由后台线程 router 去处理
+//
+func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction, args []interface{}) error {
 	// keep track of how many outstanding producers we're dealing with
 	// in order to later ensure that we clean them all up...
 	atomic.AddInt32(&w.concurrentProducers, 1)
 	defer atomic.AddInt32(&w.concurrentProducers, -1)
 
 	if atomic.LoadInt32(&w.state) != StateConnected {
+		// 延迟连接策略
+		// 为客户端记录 state，初始化时不做处理，在首次执行网络请求时才发起连接，合理减少服务端连接
 		err := w.connect()
 		if err != nil {
 			return err
@@ -312,6 +320,7 @@ func (w *Producer) connect() error {
 		w.conn.SetLoggerForLevel(w.logger[index], LogLevel(index), format)
 	}
 
+	// 向 nsqd 注册客户端并开启 eventLoop
 	_, err := w.conn.Connect()
 	if err != nil {
 		w.conn.Close()
@@ -321,6 +330,8 @@ func (w *Producer) connect() error {
 	atomic.StoreInt32(&w.state, StateConnected)
 	w.closeChan = make(chan int)
 	w.wg.Add(1)
+
+	// 跟踪消息发送与 ACK
 	go w.router()
 
 	return nil
@@ -342,6 +353,7 @@ func (w *Producer) close() {
 func (w *Producer) router() {
 	for {
 		select {
+		// 发送消息
 		case t := <-w.transactionChan:
 			w.transactions = append(w.transactions, t)
 			err := w.conn.WriteCommand(t.cmd)
@@ -349,7 +361,9 @@ func (w *Producer) router() {
 				w.log(LogLevelError, "(%s) sending command - %s", w.conn.String(), err)
 				w.close()
 			}
+		// 接收回复
 		case data := <-w.responseChan:
+			// TODO: 如何实现有序收发
 			w.popTransaction(FrameTypeResponse, data)
 		case data := <-w.errorChan:
 			w.popTransaction(FrameTypeError, data)

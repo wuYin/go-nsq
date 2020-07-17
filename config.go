@@ -32,10 +32,13 @@ type defaultsHandler interface {
 
 // BackoffStrategy defines a strategy for calculating the duration of time
 // a consumer should backoff for a given attempt
+// 抽离规避重试策略
 type BackoffStrategy interface {
+	// 第 attempt 重试，返回需重新等待的时间
 	Calculate(attempt int) time.Duration
 }
 
+// 1. 默认二次线性规避
 // ExponentialStrategy implements an exponential backoff strategy (default)
 type ExponentialStrategy struct {
 	cfg *Config
@@ -53,6 +56,7 @@ func (s *ExponentialStrategy) setConfig(cfg *Config) {
 }
 
 // FullJitterStrategy implements http://www.awsarchitectureblog.com/2015/03/backoff.html
+// 2. 全量随机抖动规避
 type FullJitterStrategy struct {
 	cfg *Config
 
@@ -90,8 +94,11 @@ type Config struct {
 	initialized bool
 
 	// used to Initialize, Validate
-	configHandlers []configHandler
+	configHandlers []configHandler // config 内部配套 handlers 做初始化和校验
 
+	//
+	// 网络连接配置
+	//
 	DialTimeout time.Duration `opt:"dial_timeout" default:"1s"`
 
 	// Deadlines for network reads and writes
@@ -108,23 +115,37 @@ type Config struct {
 	//
 	// NOTE: when not using nsqlookupd, LookupdPollInterval represents the duration of time between
 	// reconnection attempts
+
+	//
+	// lookupd 周期配置
+	//
 	LookupdPollInterval time.Duration `opt:"lookupd_poll_interval" min:"10ms" max:"5m" default:"60s"`
+	// TODO: consumer 启动时随机抖动
 	LookupdPollJitter   float64       `opt:"lookupd_poll_jitter" min:"0" max:"1" default:"0.3"`
 
 	// Maximum duration when REQueueing (for doubling of deferred requeue)
+	//
+	// ReQueue 延迟配置
+	//
 	MaxRequeueDelay     time.Duration `opt:"max_requeue_delay" min:"0" max:"60m" default:"15m"`
 	DefaultRequeueDelay time.Duration `opt:"default_requeue_delay" min:"0" max:"60m" default:"90s"`
 
+
+	//
+	// 重试策略和参数配置
+	//
 	// Backoff strategy, defaults to exponential backoff. Overwrite this to define alternative backoff algrithms.
 	BackoffStrategy BackoffStrategy `opt:"backoff_strategy" default:"exponential"`
 	// Maximum amount of time to backoff when processing fails 0 == no backoff
 	MaxBackoffDuration time.Duration `opt:"max_backoff_duration" min:"0" max:"60m" default:"2m"`
 	// Unit of time for calculating consumer backoff
 	BackoffMultiplier time.Duration `opt:"backoff_multiplier" min:"0" max:"60m" default:"1s"`
-
 	// Maximum number of times this consumer will attempt to process a message before giving up
 	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"5"`
 
+	//
+	// RDY 超时
+	//
 	// Duration to wait for a message from an nsqd when in a state where RDY
 	// counts are re-distributed (e.g. max_in_flight < num_producers)
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`

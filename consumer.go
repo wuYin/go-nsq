@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+//
+// Handler 设计模式
+// 类型本身是 func，但同时实现了接口，直接调用自身
+//
+
 // Handler is the message processing interface for Consumer
 //
 // Implement this interface for handlers that return whether or not message
@@ -91,7 +96,8 @@ type Consumer struct {
 	totalRdyCount    int64
 	backoffDuration  int64
 	backoffCounter   int32
-	maxInFlight      int32
+
+	maxInFlight int32
 
 	mtx sync.RWMutex
 
@@ -102,7 +108,7 @@ type Consumer struct {
 	behaviorDelegate interface{}
 
 	id      int64
-	topic   string
+	topic   string // <topic, channel> : consumer
 	channel string
 	config  Config
 
@@ -118,10 +124,9 @@ type Consumer struct {
 	rdyRetryMtx    sync.Mutex
 	rdyRetryTimers map[string]*time.Timer
 
-	pendingConnections map[string]*Conn
+	pendingConnections map[string]*Conn // 管理与 producer nsqd TCP 连接
 	connections        map[string]*Conn
-
-	nsqdTCPAddrs []string
+	nsqdTCPAddrs       []string
 
 	// used at connection close to force a possible reconnect
 	lookupdRecheckChan chan int
@@ -166,7 +171,7 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 		logger:      make([]logger, LogLevelMax+1),
 		logLvl:      LogLevelInfo,
-		maxInFlight: int32(config.MaxInFlight),
+		maxInFlight: int32(config.MaxInFlight), // 允许处理
 
 		incomingMessages: make(chan *Message),
 
@@ -284,14 +289,17 @@ func (r *Consumer) SetBehaviorDelegate(cb interface{}) {
 //
 // This may change dynamically based on the number of connections to nsqd the Consumer
 // is responsible for.
+// consumer 连接多个 nsqd 时，各 nsqd 均摊最大 in-flight 消息数
 func (r *Consumer) perConnMaxInFlight() int64 {
-	b := float64(r.getMaxInFlight())
-	s := b / float64(len(r.conns()))
-	return int64(math.Min(math.Max(1, s), b))
+	max := float64(r.getMaxInFlight())
+	avg := max / float64(len(r.conns()))
+	return int64(math.Min(math.Max(1, avg), max))
 }
 
 // IsStarved indicates whether any connections for this consumer are blocked on processing
 // before being able to receive more messages (ie. RDY count of 0 and not exiting)
+// 检测 consumer 是否有连接处于饥饿状态
+// 饥饿：无法接受更多消息，处理卡住
 func (r *Consumer) IsStarved() bool {
 	for _, conn := range r.conns() {
 		threshold := int64(float64(conn.RDY()) * 0.85)
@@ -483,6 +491,8 @@ type peerInfo struct {
 // which nsqd's provide the topic we are consuming.
 //
 // initiate a connection to any new producers that are identified.
+// 走 HTTP 向 nsqlookup 查询要消费的 topic 所在的 nsqd 地址
+// 查询到 TCP 地址后走 ConnectToNSQD 逐个连接
 func (r *Consumer) queryLookupd() {
 	retries := 0
 
@@ -564,7 +574,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	_, ok := r.connections[addr]
 	if ok || pendingOk {
 		r.mtx.Unlock()
-		return ErrAlreadyConnected
+		return ErrAlreadyConnected // mixed connecting state
 	}
 	r.pendingConnections[addr] = conn
 	if idx := indexOf(addr, r.nsqdTCPAddrs); idx == -1 {
@@ -581,6 +591,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		conn.Close()
 	}
 
+	// 1. 向 producer nsqd 发起连接，开启读写 eventLoop
 	resp, err := conn.Connect()
 	if err != nil {
 		cleanupConnection()
@@ -595,6 +606,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		}
 	}
 
+	// 2. 发起 Subscribe
 	cmd := Subscribe(r.topic, r.channel)
 	err = conn.WriteCommand(cmd)
 	if err != nil {
@@ -898,6 +910,7 @@ func (r *Consumer) inBackoffTimeout() bool {
 }
 
 func (r *Consumer) maybeUpdateRDY(conn *Conn) {
+	// backoff 时不更新 rdy
 	inBackoff := r.inBackoff()
 	inBackoffTimeout := r.inBackoffTimeout()
 	if inBackoff || inBackoffTimeout {
@@ -950,12 +963,21 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 	// never exceed our global max in flight. truncate if possible.
 	// this could help a new connection get partial max-in-flight
 	rdyCount := c.RDY()
+
+	// 连接 conn 能增长到的最大 rdy
+	// (配置的最大 inflight - 消费者在所有连接上的 rdy 和) + conn 已持有的 rdy
 	maxPossibleRdy := int64(r.getMaxInFlight()) - atomic.LoadInt64(&r.totalRdyCount) + rdyCount
+	// 1. conn 的 rdy 被限制在均值以下
 	if maxPossibleRdy > 0 && maxPossibleRdy < count {
 		count = maxPossibleRdy
 	}
+
+	// 2. 没有可用的 rdy 数量
 	if maxPossibleRdy <= 0 && count > 0 {
 		if rdyCount == 0 {
+			// 死局
+			// conn 未持有且没有空闲 rdy，加一个延迟重试
+			// 直到其他 conn 释放或 maxInFlight 配置更新
 			// we wanted to exit a zero RDY count but we couldn't send it...
 			// in order to prevent eternal starvation we reschedule this attempt
 			// (if any other RDY update succeeds this timer will be stopped)
@@ -994,6 +1016,7 @@ func (r *Consumer) sendRDY(c *Conn, count int64) error {
 	return nil
 }
 
+// consumer 动态均衡多个 conn 的 rdy 配额
 func (r *Consumer) redistributeRDY() {
 	if r.inBackoffTimeout() {
 		return
@@ -1022,10 +1045,11 @@ func (r *Consumer) redistributeRDY() {
 		return
 	}
 
+	// 找出慢连接将 rdy 置为 0，不再接收新消息
 	possibleConns := make([]*Conn, 0, len(conns))
 	for _, c := range conns {
-		lastMsgDuration := time.Now().Sub(c.LastMessageTime())
-		lastRdyDuration := time.Now().Sub(c.LastRdyTime())
+		lastMsgDuration := time.Now().Sub(c.LastMessageTime()) // 距上次收消息
+		lastRdyDuration := time.Now().Sub(c.LastRdyTime()) // 距上次更新 rdy
 		rdyCount := c.RDY()
 		r.log(LogLevelDebug, "(%s) rdy: %d (last message received %s)",
 			c.String(), rdyCount, lastMsgDuration)
@@ -1041,11 +1065,13 @@ func (r *Consumer) redistributeRDY() {
 		possibleConns = append(possibleConns, c)
 	}
 
+	// 计算剩余可用 rdy
 	availableMaxInFlight := int64(maxInFlight) - atomic.LoadInt64(&r.totalRdyCount)
 	if r.inBackoff() {
 		availableMaxInFlight = 1 - atomic.LoadInt64(&r.totalRdyCount)
 	}
 
+	// 随机分配给其他 conn
 	for len(possibleConns) > 0 && availableMaxInFlight > 0 {
 		availableMaxInFlight--
 		r.rngMtx.Lock()

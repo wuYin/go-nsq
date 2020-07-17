@@ -173,7 +173,7 @@ func (c *Conn) getLogLevel() LogLevel {
 func (c *Conn) Connect() (*IdentifyResponse, error) {
 	dialer := &net.Dialer{
 		LocalAddr: c.config.LocalAddr,
-		Timeout:   c.config.DialTimeout,
+		Timeout:   c.config.DialTimeout, // 默认 1s
 	}
 
 	conn, err := dialer.Dial("tcp", c.addr)
@@ -184,12 +184,14 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 	c.r = conn
 	c.w = conn
 
+	// 1. 声明协议
 	_, err = c.Write(MagicV2)
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("[%s] failed to write magic - %s", c.addr, err)
 	}
 
+	// 2. 注册
 	resp, err := c.identify()
 	if err != nil {
 		return nil, err
@@ -209,6 +211,8 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 
 	c.wg.Add(2)
 	atomic.StoreInt32(&c.readLoopRunning, 1)
+
+	// 3. 开启 EventLoop
 	go c.readLoop()
 	go c.writeLoop()
 	return resp, nil
@@ -276,6 +280,9 @@ func (c *Conn) String() string {
 	return c.addr
 }
 
+//
+// 配置超时的读写 io
+//
 // Read performs a deadlined read on the underlying TCP connection
 func (c *Conn) Read(p []byte) (int, error) {
 	c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
@@ -290,6 +297,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 // WriteCommand is a goroutine safe method to write a Command
 // to this connection, and flush.
+// 并发安全的 Write
 func (c *Conn) WriteCommand(cmd *Command) error {
 	c.mtx.Lock()
 
@@ -320,6 +328,8 @@ func (c *Conn) Flush() error {
 	return nil
 }
 
+// 与服务端同步压缩、加密等配置
+// 并为 conn 加上读写 buffer
 func (c *Conn) identify() (*IdentifyResponse, error) {
 	ci := make(map[string]interface{})
 	ci["client_id"] = c.config.ClientID
@@ -513,44 +523,49 @@ func (c *Conn) auth(secret string) error {
 
 func (c *Conn) readLoop() {
 	delegate := &connMessageDelegate{c}
+
+EXIT:
 	for {
 		if atomic.LoadInt32(&c.closeFlag) == 1 {
-			goto exit
+			break
 		}
 
 		frameType, data, err := ReadUnpackedResponse(c)
 		if err != nil {
 			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
-				goto exit
+				break
 			}
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
 			}
-			goto exit
+			break
 		}
 
-		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) {
+		// 1. 心跳
+		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) { // 心跳包 payload
 			c.log(LogLevelDebug, "heartbeat received")
 			c.delegate.OnHeartbeat(c)
-			err := c.WriteCommand(Nop())
+			err := c.WriteCommand(Nop()) // pong
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
-				goto exit
+				break
 			}
 			continue
 		}
 
 		switch frameType {
+		// 2. producer 接收 ack
 		case FrameTypeResponse:
 			c.delegate.OnResponse(c, data)
+		// 3. consumer 接收 msg
 		case FrameTypeMessage:
 			msg, err := DecodeMessage(data)
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
-				goto exit
+				break EXIT
 			}
 			msg.Delegate = delegate
 			msg.NSQDAddress = c.String()
@@ -568,7 +583,6 @@ func (c *Conn) readLoop() {
 		}
 	}
 
-exit:
 	atomic.StoreInt32(&c.readLoopRunning, 0)
 	// start the connection close
 	messagesInFlight := atomic.LoadInt64(&c.messagesInFlight)

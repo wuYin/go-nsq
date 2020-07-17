@@ -48,6 +48,7 @@ func isValidName(name string) bool {
 //    |  4-byte  || N-byte
 //    ------------------------...
 //        size       data
+// 读取一个完整的数据包
 func ReadResponse(r io.Reader) ([]byte, error) {
 	var msgSize int32
 
